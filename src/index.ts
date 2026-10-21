@@ -23,6 +23,10 @@ const PORT = Number(process.env.PORT ?? 8787);
 const PUBLIC_BASE = (process.env.PUBLIC_BASE ?? `http://127.0.0.1:${PORT}`).replace(/\/$/, "");
 const PAIRING = process.env.BRIDGE_PAIRING ?? String(crypto.randomInt(100000, 1000000));
 const RING_CAP = 5000;
+const AUTO_PROMPT = process.env.BRIDGE_AUTO_PROMPT !== "0";
+const STABLE_SECONDS = Number(process.env.BRIDGE_STABLE_SECONDS ?? 10);
+const SESSION_ACTIVE_RE = /RECORD 完成——会话已激活|MODE: 隐形屏 已启动|✓ VideoConfig/;
+const SESSION_BAD_RE = /推流中止|Connection reset|SESSION 结束|SESSION 保活结束|EVENT: 读取结束|整轮 reset/;
 const CMD_TIMEOUT_MS = 15000;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -49,6 +53,15 @@ interface Device {
   ring: LogLine[];
   pending: Map<string, Pending>;
   since: number;
+  /** 会话稳定判定（提示用户开始复现）：idle→active（会话激活）→stable（静默 N 秒）。 */
+  watch: {
+    auto: boolean;
+    state: "idle" | "active" | "stable";
+    activeAt: number;
+    badSeen: boolean;
+    prompted: boolean;
+    stableSeconds: number;
+  };
 }
 
 const devices = new Map<string, Device>();
@@ -64,7 +77,44 @@ function pushLine(device: Device, seq: number, text: string) {
   device.lastSeq = seq;
   device.ring.push({ seq, text });
   if (device.ring.length > RING_CAP) device.ring.splice(0, device.ring.length - RING_CAP);
+  watchFeed(device, text);
 }
+
+// ---- 会话稳定判定 → 提示用户开始复现 ----
+// 录制（RAW 转储/文件日志）在 App 侧常开；这里判定的是「连接已建立且持续无断线」，
+// 时机成熟时在手机悬浮窗提示用户开始复现问题——保证录到的段落干净、可归因。
+function watchFeed(device: Device, text: string) {
+  const w = device.watch;
+  if (SESSION_BAD_RE.test(text)) {
+    if (w.state !== "idle") log(`设备 ${device.deviceId} 会话中断（${text.slice(0, 60)}…）——稳定判定复位`);
+    w.state = "idle";
+    w.badSeen = true;
+    w.prompted = false;
+    return;
+  }
+  if (SESSION_ACTIVE_RE.test(text) && w.state === "idle") {
+    w.state = "active";
+    w.activeAt = Date.now();
+    w.badSeen = false;
+    log(`设备 ${device.deviceId} 会话已激活——静默 ${w.stableSeconds}s 后提示复现`);
+  }
+}
+
+setInterval(() => {
+  for (const device of devices.values()) {
+    const w = device.watch;
+    if (w.state !== "active" || !w.auto || w.prompted) continue;
+    if (Date.now() - w.activeAt >= w.stableSeconds * 1000) {
+      w.state = "stable";
+      w.prompted = true;
+      const text = `连接已稳定（${w.stableSeconds}s 无断线）——请现在开始复现问题；完成后告知开发者即可（全程已录制）`;
+      if (device.ws?.readyState === WebSocket.OPEN) {
+        device.ws.send(JSON.stringify({ t: "notify", text }));
+        log(`设备 ${device.deviceId} 稳定提示已下发（悬浮窗）`);
+      }
+    }
+  }
+}, 1000).unref();
 
 function deviceOrThrow(deviceId: string): Device {
   const device = devices.get(deviceId);
@@ -133,7 +183,17 @@ wss.on("connection", (ws: WebSocket) => {
         return;
       }
       const id = String(msg.deviceId ?? "unknown");
-      device = devices.get(id) ?? { ws: null, deviceId: id, lastSeq: 0, ring: [], pending: new Map(), since: 0 };
+      device =
+        devices.get(id) ?? {
+          ws: null,
+          deviceId: id,
+          lastSeq: 0,
+          ring: [],
+          pending: new Map(),
+          since: 0,
+          watch: { auto: AUTO_PROMPT, state: "idle", activeAt: 0, badSeen: false, prompted: false, stableSeconds: STABLE_SECONDS },
+        };
+      device.watch.auto = AUTO_PROMPT; // 环境变量热生效
       device.ws = ws;
       device.model = msg.deviceModel;
       device.appVersion = msg.appVersion;
@@ -263,6 +323,44 @@ mcp.tool(
     const device = deviceOrThrow(deviceId);
     send(device, { t: "notify", text });
     return { content: [{ type: "text" as const, text: "已下发" }] };
+  },
+);
+
+mcp.tool(
+  "prompt_reproduce",
+  "在设备悬浮窗提示用户开始复现问题（稳定判定之外的手动触发；text 可自定义引导语）",
+  { deviceId: z.string(), text: z.string().optional() },
+  async ({ deviceId, text }) => {
+    const device = deviceOrThrow(deviceId);
+    send(device, {
+      t: "notify",
+      text: text ?? "请现在开始复现问题；完成后告知开发者即可（全程已录制）",
+    });
+    return { content: [{ type: "text" as const, text: "已下发悬浮窗提示" }] };
+  },
+);
+
+mcp.tool(
+  "watch_stability",
+  "查看/配置会话稳定判定（auto 开关、静默窗口秒数；稳定后自动提示用户复现）",
+  { deviceId: z.string(), auto: z.boolean().optional(), stableSeconds: z.number().int().min(3).max(120).optional() },
+  async ({ deviceId, auto, stableSeconds }) => {
+    const device = deviceOrThrow(deviceId);
+    if (auto !== undefined) device.watch.auto = auto;
+    if (stableSeconds !== undefined) device.watch.stableSeconds = stableSeconds;
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify({
+            auto: device.watch.auto,
+            state: device.watch.state,
+            stableSeconds: device.watch.stableSeconds,
+            prompted: device.watch.prompted,
+          }),
+        },
+      ],
+    };
   },
 );
 

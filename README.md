@@ -13,7 +13,12 @@ CarDeck 远程调试桥——一套面向「远程排障 + AI agent」的调试�
   - 服务端可下发**白名单命令**：发起连接 / 断开连接 / 查询状态 / ping
   - 服务端可下发**悬浮窗提示**（App 上可拖动）
   - 服务端可推送**新 APK**：App 下载并校验 sha256 → 悬浮窗提示「安装」→ 先停会话释放虚拟屏（防止系统安装确认弹窗落到车机侧虚拟屏）→ PackageInstaller 发起；重装后首启动询问「继续进入调试模式？」并自动重连
-- **Agent 面**（MCP over stdio）：`bridge_status` / `logs_tail` / `logs_fetch` / `cmd` / `notify` / `offer_apk`
+- **会话稳定提示**（录制引导）：服务端盯实时日志——`RECORD 完成`/`隐形屏已启动` 判定会话激活，
+  静默 N 秒（默认 10，`BRIDGE_STABLE_SECONDS`）无 `推流中止/Connection reset/SESSION 结束`
+  即在手机悬浮窗提示**「连接已稳定——请现在开始复现问题」**（App 侧 RAW 转储与文件日志
+  常开，保证录到的段落干净可归因）；断线自动复位、下轮再提示。`BRIDGE_AUTO_PROMPT=0` 关闭。
+- **Agent 面**（MCP over stdio）：`bridge_status` / `logs_tail` / `logs_fetch` / `cmd` / `notify` /
+  `prompt_reproduce`（手动下发复现引导）/ `watch_stability`（查看/配置稳定判定）/ `offer_apk`
 - **文件面**：`GET /apk/<file>` 提供 APK 下载（重装闭环用）
 
 ## 快速开始

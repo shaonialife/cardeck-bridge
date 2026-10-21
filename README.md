@@ -33,19 +33,56 @@ npm start
 
 ## 暴露到公网（内网穿透）
 
-任选其一：
+按场景选：
+
+### 方案 A（国内跨地区，推荐）：frp + 国内轻量 VPS
+
+Cloudflare 免费版无大陆节点（流量绕美西）且默认 QUIC 受 UDP QoS 限速，国内长连接不稳——
+两端都在国内时 frp 直连 VPS 最快最稳（裸 IP 高位端口纯 TCP 转发，无需域名备案）。
 
 ```bash
-# 方案 A：Cloudflare Tunnel（免费、自带 TLS 域名，wss 直接可用）
-cloudflared tunnel --url http://127.0.0.1:8787
-# 手机端填 wss://<分配的域名>；并 export PUBLIC_BASE=https://<域名> 后重启服务（APK 下载链接要用公网基址）
+# ── VPS 侧（阿里云/腾讯云轻量，几块钱/月）──
+# 1) 下载 frp（https://github.com/fatedier/frp/releases，linux_amd64）
+# 2) frps.toml：
+#      bindPort = 7000
+#      auth.token = "<强随机串>"
+# 3) 启动（建议 systemd 常驻）：
+./frps -c frps.toml
+# 4) 安全组/防火墙放行 7000（frp 控制）与 8787（桥端口）
 
-# 方案 B：frp（已有 VPS 时，转发 TCP 即可）
-# frpc.toml: [[proxies]] ... remotePort = 8788
-# 手机端填 ws://<VPS>:8788；PUBLIC_BASE=http://<VPS>:8788
+# ── 开发者电脑侧 ──
+# frpc.toml：
+#      serverAddr = "<VPS公网IP>"
+#      serverPort = 7000
+#      auth.token = "<同上强随机串>"
+#      [[proxies]]
+#      name = "cardeck-bridge"
+#      type = "tcp"
+#      remotePort = 8787
+./frpc -c frpc.toml &
+BRIDGE_PAIRING=<自定6位> PUBLIC_BASE=http://<VPS公网IP>:8787 npm start
+
+# ── 手机侧（remoteDebug 变体）──
+# 「CarDeck 远程调试」→ 地址填 ws://<VPS公网IP>:8787 → 配对码 → 连接
 ```
 
-环境变量：`PORT`（默认 8787）、`PUBLIC_BASE`（APK 下载链接的公网基址）、`BRIDGE_PAIRING`（固定配对码，不设则随机生成）。
+注意：明文 TCP（配对码只防误连，不防窃听）；调试日志含热点名/蓝牙地址，介意可换
+自有域名 + HTTPS 网关终结 TLS 后再转发。
+
+### 方案 B：国内穿透服务（免 VPS）
+
+natapp / cpolar / 花生壳等，免费档有限速（传日志够用，推 APK 慢）。按其文档把本地
+8787 映射为 tcp 隧道即可，手机端填 `ws://<映射地址>`。
+
+### 方案 C：Cloudflare Tunnel（海外车友 / 已有域名）
+
+```bash
+cloudflared tunnel --protocol http2 --url http://127.0.0.1:8787
+# 国内默认 QUIC 受 UDP QoS 限速，强制 http2 更稳；临时隧道（trycloudflare.com）线路质量差，
+# 建议绑自有域名 + 优选 IP。手机端填 wss://<域名>；PUBLIC_BASE=https://<域名>
+```
+
+环境变量：`PORT`（默认 8787）、`PUBLIC_BASE`（APK 下载链接的公网基址）、`BRIDGE_PAIRING`（固定配对码，不设则随机生成）、`BRIDGE_AUTO_PROMPT`/`BRIDGE_STABLE_SECONDS`（稳定提示）。
 
 ## 接入 AI agent（MCP）
 

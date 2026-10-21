@@ -58,6 +58,8 @@ Cloudflare 免费版无大陆节点（流量绕美西）且默认 QUIC 受 UDP Q
 #      [[proxies]]
 #      name = "cardeck-bridge"
 #      type = "tcp"
+#      localIP = "127.0.0.1"
+#      localPort = 8787      # 必填：frp 0.7x 不默认继承 remotePort
 #      remotePort = 8787
 ./frpc -c frpc.toml &
 BRIDGE_PAIRING=<自定6位> PUBLIC_BASE=http://<VPS公网IP>:8787 npm start

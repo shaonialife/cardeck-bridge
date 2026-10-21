@@ -193,6 +193,16 @@ wss.on("connection", (ws: WebSocket) => {
           since: 0,
           watch: { auto: AUTO_PROMPT, state: "idle", activeAt: 0, badSeen: false, prompted: false, stableSeconds: STABLE_SECONDS },
         };
+      // 设备进程重启：App 端 seq 每进程从 1 计数，若桥仍留着上次的游标，
+      // 去重逻辑（seq <= lastSeq 丢弃）会把新进程的全部日志静默丢掉——
+      // 上报的 lastSeq 比桥记录的小即判定重启，清空游标与缓冲重新收。
+      const reportedLast = Number(msg.lastSeq ?? 0);
+      if (reportedLast < device.lastSeq) {
+        log(`设备 ${id} 进程重启（lastSeq ${device.lastSeq} → ${reportedLast}），重置日志游标与缓冲`);
+        device.lastSeq = 0;
+        device.ring = [];
+        device.since = 0;
+      }
       device.watch.auto = AUTO_PROMPT; // 环境变量热生效
       device.ws = ws;
       device.model = msg.deviceModel;

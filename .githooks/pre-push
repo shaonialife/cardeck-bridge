@@ -1,0 +1,55 @@
+#!/bin/sh
+# 推送前兜底：扫描所有**待推送提交**的作者与提交者邮箱，
+# 只要出现非 noreply 邮箱就拒绝推送（公开仓库，提交一旦推送无法真正撤回）。
+#
+# 为什么提交钩子之外还要这一层：
+#  - `git commit --no-verify` 可绕过 pre-commit；
+#  - cherry-pick / rebase / merge 会**沿用原提交的作者**，pre-commit 看不出来；
+#  - 从其它仓库 pull 进来的提交自带对方邮箱。
+# 这一层检查的是「即将离开本机的对象」，能覆盖以上全部情况。
+set -eu
+cd "$(git rev-parse --show-toplevel)"
+
+ALLOWED_DOMAIN="users.noreply.github.com"
+ZERO="0000000000000000000000000000000000000000"
+
+fail=0
+# stdin 每行：<local ref> <local sha> <remote ref> <remote sha>
+while read -r local_ref local_sha remote_ref remote_sha || [ -n "${local_ref:-}" ]; do
+    [ -z "${local_sha:-}" ] && continue
+    [ "${local_sha}" = "${ZERO}" ] && continue # 删除分支，无提交
+
+    if [ "$remote_sha" = "$ZERO" ]; then
+        # 远端还没有这个分支：检查整个历史
+        range="$local_sha"
+        label="全部历史"
+    else
+        # 远端已有：只检查新增部分
+        range="$remote_sha..$local_sha"
+        label="增量"
+    fi
+
+    # 作者与提交者邮箱都要查（GitHub 两个都展示）
+    bad=$(
+        git log --format='%ae%n%ce' $range 2>/dev/null |
+            grep -v "@${ALLOWED_DOMAIN}$" |
+            grep -v '^$' |
+            sort -u || true
+    )
+
+    if [ -n "$bad" ]; then
+        echo ""
+        echo "✗ 推送被拦截：${local_ref} → ${remote_ref}（${label}）含非白名单邮箱："
+        printf '%s\n' "$bad" | sed 's/^/    /'
+        echo ""
+        echo "  本仓库只允许 *@${ALLOWED_DOMAIN}（公开仓库，避免泄露公司邮箱）。"
+        echo "  修复选项："
+        echo "    · 尚未提交：git config user.email '16135960+shaonialife@users.noreply.github.com'"
+        echo "    · 已提交未推送：改写作者后重推"
+        echo "    · 来自其它仓库的历史：git filter-branch/filter-repo 改写后再推"
+        echo ""
+        fail=1
+    fi
+done
+
+exit $fail

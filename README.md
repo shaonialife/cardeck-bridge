@@ -21,6 +21,18 @@ CarDeck 远程调试桥——一套面向「远程排障 + AI agent」的调试�
   `prompt_reproduce`（手动下发复现引导）/ `watch_stability`（查看/配置稳定判定）/ `offer_apk`
 - **文件面**：`GET /apk/<file>` 提供 APK 下载（重装闭环用）
 
+## 日志通道（2026-10-24）
+
+- **实时流**：App 推送日志（批量回补 + 500ms 批），服务端按 seq 去重；例行高频行
+  （视频帧/keepAlive/timesync/采集样本）**只进磁盘不进内存环形**——环形里留下的
+  都是有用段。
+- **磁盘事实源**：全部日志行 JSONL 落盘 `logs/<deviceId>.jsonl`（20MB 自动轮换；
+  设备进程重启自动留档新开文件）。`logs_fetch` 读磁盘——历史完整、跨进程世代。
+- **`logs_file` 工具**：拉设备 `main_debug.log` 尾部（文件日志才是含 RAW 协议
+  转储的完整事实源；内存环形怎么扩都有窗口）。gzip 单消息传输，落盘 `logs/`
+  下的 `.log` 明文，可直接 grep。设备进程重启会重置服务端去重游标——重启前的
+  历史用 `logs_file` 或 `logs/*.jsonl` 世代文件。
+
 ## 快速开始
 
 ```bash

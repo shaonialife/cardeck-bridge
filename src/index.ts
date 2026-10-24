@@ -15,6 +15,7 @@ import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer, WebSocket } from "ws";
+import zlib from "node:zlib";
 import { makeDelta } from "./deltadiff.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -39,6 +40,40 @@ const PEER_DEAD_MS = 90_000;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(__dirname, "..", "public");
 fs.mkdirSync(publicDir, { recursive: true });
+// 设备日志落盘：JSONL 按行追加（内存环形只有 5000 行，推流几分钟就滚没；
+// 进程重启还会重置环形——历史必须有磁盘事实源）。文件按「设备进程世代」组织：
+// 检测到设备进程重启（seq 回退）即轮换新文件，文件内 seq 单调。
+const logsDir = path.join(__dirname, "..", "logs");
+fs.mkdirSync(logsDir, { recursive: true });
+const LOG_FILE_MAX = 20 * 1024 * 1024;
+// 高频降噪：这些例行行不进内存环形（落盘文件**不降噪**，历史完整保留）。
+// 推流时它们占 5~30 行/秒，环形 5000 行几分钟就滚没，有用段（配对/403/差分）被挤掉。
+const NOISE_RE = /VIDEO: 帧 #|VIDEO: keepAlive #|TIMING: timesync 应答|COMPOSER: 竖屏 tile|AUDIO: 采集样本(?!.*⚠)/;
+
+function logFilePath(deviceId: string): string {
+  return path.join(logsDir, `${deviceId}.jsonl`);
+}
+
+function appendLogLine(deviceId: string, seq: number, text: string) {
+  try {
+    const file = logFilePath(deviceId);
+    if (fs.existsSync(file) && fs.statSync(file).size >= LOG_FILE_MAX) {
+      fs.renameSync(file, file.replace(/\.jsonl$/, `-${Date.now()}.jsonl`));
+    }
+    fs.appendFileSync(file, JSON.stringify({ seq, text }) + "\n");
+  } catch {
+    /* 落盘失败不阻塞内存路径 */
+  }
+}
+
+function rotateLogFile(deviceId: string) {
+  try {
+    const file = logFilePath(deviceId);
+    if (fs.existsSync(file)) fs.renameSync(file, file.replace(/\.jsonl$/, `-${Date.now()}.jsonl`));
+  } catch {
+    /* 忽略 */
+  }
+}
 
 // 差分基线索引：sha256 → 服务器上的 APK 路径。设备 hello 上报自己已安装 APK
 // 的 sha256，offer 时若基线在库即生成差分包（典型 15MB → 0.1~2MB）。
@@ -104,8 +139,11 @@ function pushLine(device: Device, seq: number, text: string) {
   if (seq <= 0) return;
   if (seq <= device.lastSeq) return; // 重复/乱序：按 seq 去重
   device.lastSeq = seq;
-  device.ring.push({ seq, text });
-  if (device.ring.length > RING_CAP) device.ring.splice(0, device.ring.length - RING_CAP);
+  appendLogLine(device.deviceId, seq, text); // 磁盘：全量，不降噪，不滚动丢失
+  if (!NOISE_RE.test(text)) {
+    device.ring.push({ seq, text });
+    if (device.ring.length > RING_CAP) device.ring.splice(0, device.ring.length - RING_CAP);
+  }
   watchFeed(device, text);
 }
 
@@ -180,13 +218,18 @@ function send(device: Device, obj: Record<string, unknown>) {
   device.ws.send(JSON.stringify(obj));
 }
 
-function roundTrip(device: Device, name: string, args: Record<string, unknown> = {}): Promise<unknown> {
+function roundTrip(
+  device: Device,
+  name: string,
+  args: Record<string, unknown> = {},
+  timeoutMs: number = CMD_TIMEOUT_MS,
+): Promise<unknown> {
   const id = crypto.randomUUID();
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       device.pending.delete(id);
-      reject(new Error(`命令 ${name} 超时（${CMD_TIMEOUT_MS}ms）`));
-    }, CMD_TIMEOUT_MS);
+      reject(new Error(`命令 ${name} 超时（${timeoutMs}ms）`));
+    }, timeoutMs);
     device.pending.set(id, { resolve, reject, timer });
     try {
       send(device, { t: "cmd", id, name, args });
@@ -249,7 +292,8 @@ wss.on("connection", (ws: WebSocket) => {
       // 上报的 lastSeq 比桥记录的小即判定重启，清空游标与缓冲重新收。
       const reportedLast = Number(msg.lastSeq ?? 0);
       if (reportedLast < device.lastSeq) {
-        log(`设备 ${id} 进程重启（lastSeq ${device.lastSeq} → ${reportedLast}），重置日志游标与缓冲`);
+        log(`设备 ${id} 进程重启（lastSeq ${device.lastSeq} → ${reportedLast}），重置日志游标与缓冲（旧世代日志已落盘留档）`);
+        rotateLogFile(id);
         device.lastSeq = 0;
         device.ring = [];
         device.since = 0;
@@ -297,6 +341,29 @@ wss.on("connection", (ws: WebSocket) => {
       case "status":
         log(`设备 ${device.deviceId} 状态：${msg.state}`);
         break;
+      case "log_file.data": {
+        const pending = device.pending.get(String(msg.id));
+        if (!pending) break;
+        clearTimeout(pending.timer);
+        device.pending.delete(String(msg.id));
+        try {
+          const gz = Buffer.from(String(msg.gzB64 ?? ""), "base64");
+          const raw = zlib.gunzipSync(gz);
+          const out = path.join(logsDir, `${device.deviceId}-${Date.now()}.log`);
+          fs.writeFileSync(out, raw);
+          log(`设备 ${device.deviceId} 文件日志已落盘 ${out}（原始 ${Math.round(raw.length / 1024)}KB）`);
+          pending.resolve({
+            path: out,
+            rawKB: Math.round(raw.length / 1024),
+            gzKB: Math.round(gz.length / 1024),
+            truncated: Boolean(msg.truncated),
+          });
+        } catch (e) {
+          pending.reject(new Error(`文件日志解压/落盘失败：${e}`));
+        }
+        break;
+      }
+
       case "pong":
         break;
     }
@@ -374,12 +441,63 @@ mcp.tool(
 
 mcp.tool(
   "logs_fetch",
-  "取设备 sinceSeq 之后的日志（增量拉取）",
+  "取设备 sinceSeq 之后的日志（增量拉取；读磁盘落盘文件，含全部例行行、跨进程世代）",
   { deviceId: z.string(), sinceSeq: z.number().int().default(0), max: z.number().int().min(1).max(5000).default(2000) },
   async ({ deviceId, sinceSeq, max }) => {
+    deviceOrThrow(deviceId);
+    const file = logFilePath(deviceId);
+    let lines: { seq: number; text: string }[] = [];
+    try {
+      const content = fs.readFileSync(file, "utf-8");
+      for (const line of content.split("\n")) {
+        if (!line) continue;
+        try {
+          const obj = JSON.parse(line);
+          if (obj.seq > sinceSeq) lines.push({ seq: Number(obj.seq), text: String(obj.text) });
+        } catch {
+          /* 半行（断电截断）跳过 */
+        }
+      }
+    } catch {
+      /* 文件不存在：回退内存环形 */
+      const device = devices.get(deviceId);
+      if (device) lines = device.ring.filter((l) => l.seq > sinceSeq);
+    }
+    const slice = lines.slice(0, max);
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text:
+            slice
+              .map((l) => l.text)
+              .join("\n") +
+            (lines.length > slice.length ? `\n…（还有 ${lines.length - slice.length} 行，调大 max）` : "") ||
+            "（无新日志）",
+        },
+      ],
+    };
+  },
+);
+
+mcp.tool(
+  "logs_file",
+  "拉设备文件日志（main_debug.log 尾部，含 RAW 协议转储的完整事实源；gzip 传输，落盘到 logs/ 供直接 grep）",
+  { deviceId: z.string(), maxKB: z.number().int().min(16).max(4096).default(512) },
+  async ({ deviceId, maxKB }) => {
     const device = deviceOrThrow(deviceId);
-    const lines = device.ring.filter((l) => l.seq > sinceSeq).slice(0, max);
-    return { content: [{ type: "text" as const, text: lines.map((l) => l.text).join("\n") || "（无新日志）" }] };
+    // 独立消息类型 log_file.req（不走 cmd 白名单——这不是 shell 命令，是日志回传）：
+    // 设备端 gzip→base64 单消息回传 log_file.data，按 id 匹配 pending
+    const id = crypto.randomUUID();
+    const result = (await new Promise<unknown>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        device.pending.delete(id);
+        reject(new Error(`文件日志回传超时（120s）`));
+      }, 120_000);
+      device.pending.set(id, { resolve, reject, timer });
+      send(device, { t: "log_file.req", id, maxKB });
+    })) as Record<string, unknown>;
+    return { content: [{ type: "text" as const, text: JSON.stringify(result) }] };
   },
 );
 

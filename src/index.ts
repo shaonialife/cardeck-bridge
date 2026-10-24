@@ -15,6 +15,7 @@ import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer, WebSocket } from "ws";
+import { makeDelta } from "./deltadiff.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -28,10 +29,34 @@ const STABLE_SECONDS = Number(process.env.BRIDGE_STABLE_SECONDS ?? 10);
 const SESSION_ACTIVE_RE = /RECORD 完成——会话已激活|MODE: 隐形屏 已启动|✓ VideoConfig/;
 const SESSION_BAD_RE = /推流中止|Connection reset|SESSION 结束|SESSION 保活结束|EVENT: 读取结束|整轮 reset/;
 const CMD_TIMEOUT_MS = 15000;
+// 半开检测：对端路由切换/NAT 失效时 TCP 不发 FIN，server 侧 ws 永远「OPEN」。
+// 25s 主动 ping，90s 无任何入站流量（含 pong/日志/命令应答）即 terminate——
+// 设备随即收到 TCP 断开、立刻重连（2026-10-24 真机 incident：迟到的 close 事件
+// 把新连接的 device.ws 清成 null，命令全拒而日志仍在流，拖了 3 分钟）。
+const PEER_PING_MS = 25_000;
+const PEER_DEAD_MS = 90_000;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(__dirname, "..", "public");
 fs.mkdirSync(publicDir, { recursive: true });
+
+// 差分基线索引：sha256 → 服务器上的 APK 路径。设备 hello 上报自己已安装 APK
+// 的 sha256，offer 时若基线在库即生成差分包（典型 15MB → 0.1~2MB）。
+const apkIndex = new Map<string, string>();
+{
+  const files = fs.readdirSync(publicDir).filter((f) => f.endsWith(".apk"));
+  setImmediate(() => {
+    for (const f of files) {
+      try {
+        const sha = crypto.createHash("sha256").update(fs.readFileSync(path.join(publicDir, f))).digest("hex");
+        apkIndex.set(sha, path.join(publicDir, f));
+      } catch {
+        /* 文件消失等，跳过 */
+      }
+    }
+    log(`差分基线库就绪：${apkIndex.size} 个 APK（${files.length} 个候选）`);
+  });
+}
 
 interface LogLine {
   seq: number;
@@ -47,6 +72,10 @@ interface Pending {
 interface Device {
   ws: WebSocket | null;
   deviceId: string;
+  /** 最近一次入站流量时刻（半开检测：超过 PEER_DEAD_MS 视为死链） */
+  lastSeen: number;
+  /** 设备已安装 APK 的 sha256（hello 上报）——差分更新的基线选择依据 */
+  baseSha256?: string;
   model?: string;
   appVersion?: string;
   lastSeq: number;
@@ -101,6 +130,27 @@ function watchFeed(device: Device, text: string) {
 }
 
 setInterval(() => {
+  // 半开清扫：OPEN 但久无入站 → 先 ping 探测，仍无响应到死线即 terminate。
+  // terminate 会让设备侧立刻收到 TCP 断开并重连，比等设备自己的读超时快得多。
+  for (const device of devices.values()) {
+    const ws = device.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) continue;
+    const silent = Date.now() - device.lastSeen;
+    if (silent >= PEER_DEAD_MS) {
+      log(`设备 ${device.deviceId} ${Math.round(silent / 1000)}s 无入站流量——判定半开，强制断开等重连`);
+      try {
+        ws.terminate();
+      } catch {
+        /* close 事件兜底 */
+      }
+    } else if (silent >= PEER_PING_MS) {
+      try {
+        ws.ping();
+      } catch {
+        /* 下轮再试 */
+      }
+    }
+  }
   for (const device of devices.values()) {
     const w = device.watch;
     if (w.state !== "active" || !w.auto || w.prompted) continue;
@@ -187,6 +237,7 @@ wss.on("connection", (ws: WebSocket) => {
         devices.get(id) ?? {
           ws: null,
           deviceId: id,
+          lastSeen: Date.now(),
           lastSeq: 0,
           ring: [],
           pending: new Map(),
@@ -204,7 +255,19 @@ wss.on("connection", (ws: WebSocket) => {
         device.since = 0;
       }
       device.watch.auto = AUTO_PROMPT; // 环境变量热生效
+      // 同设备新连接接管：显式终止旧 socket，防止两个 socket 同时向一个
+      // device 记录推日志、旧 socket 的迟到 close 事件又把新引用清掉
+      if (device.ws && device.ws !== ws) {
+        log(`设备 ${id} 旧连接被新连接接管——终止旧 socket`);
+        try {
+          device.ws.terminate();
+        } catch {
+          /* 已死则忽略 */
+        }
+      }
       device.ws = ws;
+      device.lastSeen = Date.now();
+      device.baseSha256 = msg.baseSha256 ? String(msg.baseSha256) : undefined;
       device.model = msg.deviceModel;
       device.appVersion = msg.appVersion;
       devices.set(id, device);
@@ -215,6 +278,7 @@ wss.on("connection", (ws: WebSocket) => {
       return;
     }
     if (!device) return;
+    device.lastSeen = Date.now();
     switch (msg.t) {
       case "log.batch": {
         const lines: any[] = msg.lines ?? [];
@@ -237,11 +301,16 @@ wss.on("connection", (ws: WebSocket) => {
         break;
     }
   });
+  ws.on("pong", () => {
+    if (device) device.lastSeen = Date.now();
+  });
   ws.on("close", () => {
     if (device) {
       log(`设备断开 ${device.deviceId}`);
       device.since = device.lastSeq; // 断线期间日志由重连后的全量回补补齐
-      device.ws = null;
+      // 身份守卫：迟到 close 的旧 socket 不得清掉新连接的引用（否则命令
+      // 全部「设备连接断开中」而日志仍在流——2026-10-24 实测 incident）
+      if (device.ws === ws) device.ws = null;
       for (const pending of device.pending.values()) {
         clearTimeout(pending.timer);
         pending.reject(new Error("设备连接断开"));
@@ -385,13 +454,38 @@ mcp.tool(
     const sha256 = crypto.createHash("sha256").update(bytes).digest("hex");
     const name = `cardeck-${version}-${Date.now()}.apk`;
     fs.writeFileSync(path.join(publicDir, name), bytes);
+    apkIndex.set(sha256, path.join(publicDir, name));
     const url = `${PUBLIC_BASE}/apk/${name}`;
-    send(device, { t: "apk.offer", url, sha256, version });
+    // 差分优先：设备基线在库里 → 生成块差分包，显著省流量（回退全量始终随附）
+    let delta: { url: string; sha256: string; baseSha256: string; sizeKB: number } | undefined;
+    const baseSha = device.baseSha256;
+    const basePath = baseSha ? apkIndex.get(baseSha) : undefined;
+    if (basePath && baseSha !== sha256) {
+      const patch = makeDelta(fs.readFileSync(basePath), bytes);
+      // 收益不足（> 全量 60%）就不值得一次基线校验的风险
+      if (patch.length < bytes.length * 0.6) {
+        const patchName = `cardeck-${version}-${Date.now()}.bspatch`;
+        fs.writeFileSync(path.join(publicDir, patchName), patch);
+        delta = {
+          url: `${PUBLIC_BASE}/apk/${patchName}`,
+          sha256: crypto.createHash("sha256").update(patch).digest("hex"),
+          baseSha256: baseSha!,
+          sizeKB: Math.round(patch.length / 1024),
+        };
+        log(`设备 ${deviceId} 差分包 ${delta.sizeKB}KB（全量 ${Math.round(bytes.length / 1024)}KB，基线 ${baseSha!.slice(0, 8)}）`);
+      }
+    }
+    send(device, { t: "apk.offer", url, sha256, version, delta });
     return {
       content: [
         {
           type: "text" as const,
-          text: JSON.stringify({ url, sha256, sizeMB: Math.round(bytes.length / 1024 / 1024) }),
+          text: JSON.stringify({
+            url,
+            sha256,
+            sizeMB: Math.round(bytes.length / 1024 / 1024),
+            delta: delta ? `${delta.sizeKB}KB（基线 ${delta.baseSha256.slice(0, 8)}）` : "无基线，全量",
+          }),
         },
       ],
     };
